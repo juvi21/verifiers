@@ -3,7 +3,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Dict, List
 
 import httpx
 import numpy as np
@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from transformers import PreTrainedTokenizerBase
 
 from verifiers import Environment
+from verifiers.rl.trainer.config import DAPOHyperParams
 
 
 class Microbatch(BaseModel):
@@ -66,6 +67,8 @@ class Generator:
         mask_truncated_completions: bool,
         zero_truncated_completions: bool,
         max_concurrent: int,
+        rl_algo: str = "grpo",
+        dapo_params: DAPOHyperParams | None = None,
     ):
         self.env = env
         self.client_base_url = client_base_url
@@ -87,6 +90,9 @@ class Generator:
         self.mask_truncated_completions = mask_truncated_completions
         self.zero_truncated_completions = zero_truncated_completions
         self.max_concurrent = max_concurrent
+        self.rl_algo = rl_algo.lower()
+        self.dapo_params = dapo_params or DAPOHyperParams()
+        self.prompt_variance: Dict[str, float] = {}
 
         # queues for communication
         self.request_queue = queue.Queue()
@@ -241,25 +247,46 @@ class Generator:
             zero_truncated_completions=self.zero_truncated_completions,
         )
 
+        dapo_metrics: dict[str, float] = {}
+        if self.rl_algo == "dapo":
+            rewards, shaping_metrics = self._apply_dapo_reward_shaping(
+                processed_results
+            )
+            processed_results.rewards = rewards
+            dapo_metrics.update(shaping_metrics)
+            selection = self._select_dapo_indices(
+                rewards,
+                processed_results.is_truncated,
+                env_results.prompt,
+                len(batch_ds),
+                batch_id,
+            )
+            if selection["indices"]:
+                filtered_rewards = self._filter_processed_outputs(
+                    processed_results,
+                    env_results,
+                    rewards,
+                    selection["indices"],
+                )
+                processed_results.rewards = filtered_rewards
+                rewards = filtered_rewards
+                advantages = selection["advantages"]
+            else:
+                advantages = self._compute_group_advantages(
+                    processed_results.rewards,
+                    len(batch_ds),
+                    normalize=self.dapo_params.normalize_advantages,
+                )
+            dapo_metrics.update(selection["metrics"])
+        else:
+            rewards = processed_results.rewards
+            advantages = self._compute_group_advantages(
+                rewards, len(batch_ds), normalize=False
+            )
+
         rewards_dict = {"reward": processed_results.rewards}
         for k in env_results.metrics:
             rewards_dict[k] = env_results.metrics[k]
-
-        rewards: list[float] = processed_results.rewards
-        advantages: list[float] = [0.0] * len(rewards)
-        prompts_in_batch = len(batch_ds)
-        for prompt_idx in range(prompts_in_batch):
-            group_indices = [
-                prompt_idx + k * prompts_in_batch
-                for k in range(self.rollouts_per_example)
-                if (prompt_idx + k * prompts_in_batch) < len(rewards)
-            ]
-            if not group_indices:
-                continue
-            group = [rewards[i] for i in group_indices]
-            gmean = sum(group) / float(len(group))
-            for idx, r in zip(group_indices, group):
-                advantages[idx] = r - gmean
 
         metrics_dict = {}
         if rewards:
@@ -312,38 +339,43 @@ class Generator:
             metrics_dict["timing/total_ms"] = float(np.mean(total_ms))
 
         metrics_dict["wall_clock/generate_s"] = float(wall_clock_s)
+        if dapo_metrics:
+            metrics_dict.update(dapo_metrics)
 
         # build per-process microbatches
         N = len(processed_results.rewards)
-        per_proc = N // self.num_processes
+        per_proc_indices = np.array_split(np.arange(N), self.num_processes)
         microbatches: list[list[Microbatch]] = []
         items_per_process: list[int] = []
-        for proc in range(self.num_processes):
-            ps = proc * per_proc
-            pe = ps + per_proc
+        for proc_indices in per_proc_indices:
+            proc_list = proc_indices.tolist()
             proc_mbs: list[Microbatch] = []
             proc_item_total = 0
-            for s in range(ps, pe, self.micro_batch_size):
-                e = min(s + self.micro_batch_size, pe)
+            if not proc_list:
+                microbatches.append(proc_mbs)
+                items_per_process.append(0)
+                continue
+            for cursor in range(0, len(proc_list), self.micro_batch_size):
+                batch_indices = proc_list[cursor : cursor + self.micro_batch_size]
                 ids_chunk = [
                     processed_results.prompt_ids[i]
                     + processed_results.completion_ids[i]
-                    for i in range(s, e)
+                    for i in batch_indices
                 ]
                 mask_chunk = [
                     processed_results.prompt_mask[i]
                     + processed_results.completion_mask[i]
-                    for i in range(s, e)
+                    for i in batch_indices
                 ]
                 slogp_chunk = [
                     [0.0] * len(processed_results.prompt_mask[i])
                     + processed_results.completion_logprobs[i]
-                    for i in range(s, e)
+                    for i in batch_indices
                 ]
                 lengths = [len(mask) for mask in mask_chunk]
                 adv_chunk = [
                     [advantages[i]] * lengths[idx]
-                    for idx, i in enumerate(list(range(s, e)))
+                    for idx, i in enumerate(batch_indices)
                 ]
                 mb_items = sum(sum(mask) for mask in mask_chunk)
                 microbatch = Microbatch(
@@ -371,3 +403,239 @@ class Generator:
             prompts=env_results.prompt,
             metrics_dict=metrics_dict,
         )
+
+    def _apply_dapo_reward_shaping(self, outputs) -> tuple[list[float], dict[str, float]]:
+        rewards = []
+        length_penalties = []
+        trunc_penalties = []
+        target = max(1, self.dapo_params.length_penalty_target)
+        cache = self.dapo_params.length_cache
+        max_penalty = self.dapo_params.length_penalty_max
+        trunc_penalty = self.dapo_params.truncation_penalty
+        for reward, completion_ids, is_truncated in zip(
+            outputs.rewards, outputs.completion_ids, outputs.is_truncated
+        ):
+            adj_reward = reward
+            penalty = 0.0
+            if (
+                self.dapo_params.length_penalty_enabled
+                and len(completion_ids) > target + cache
+            ):
+                over = len(completion_ids) - (target + cache)
+                denom = max(target * 0.5, 1)
+                frac = min(1.0, over / denom)
+                penalty = max_penalty * frac
+                adj_reward = adj_reward * (1.0 - penalty)
+            length_penalties.append(penalty)
+            if is_truncated:
+                adj_reward = adj_reward * (1.0 - trunc_penalty)
+                trunc_penalties.append(trunc_penalty)
+            else:
+                trunc_penalties.append(0.0)
+            rewards.append(adj_reward)
+        metrics = {
+            "dapo/penalty/length": float(np.mean(length_penalties))
+            if length_penalties
+            else 0.0,
+            "dapo/penalty/truncation": float(np.mean(trunc_penalties))
+            if trunc_penalties
+            else 0.0,
+        }
+        return rewards, metrics
+
+    def _filter_processed_outputs(
+        self,
+        processed_results,
+        env_results,
+        rewards,
+        indices: list[int],
+    ) -> list[float]:
+        def gather(seq):
+            return [seq[i] for i in indices]
+
+        processed_results.prompt_ids = gather(processed_results.prompt_ids)
+        processed_results.prompt_mask = gather(processed_results.prompt_mask)
+        processed_results.completion_ids = gather(processed_results.completion_ids)
+        processed_results.completion_mask = gather(processed_results.completion_mask)
+        processed_results.completion_logprobs = gather(
+            processed_results.completion_logprobs
+        )
+        processed_results.is_truncated = gather(processed_results.is_truncated)
+        filtered_rewards = gather(rewards)
+        processed_results.rewards = filtered_rewards
+
+        env_results.prompt = gather(env_results.prompt)
+        env_results.completion = gather(env_results.completion)
+        env_results.state = gather(env_results.state)
+        env_results.reward = gather(env_results.reward)
+        if env_results.metrics:
+            for key, values in env_results.metrics.items():
+                env_results.metrics[key] = gather(values)
+        return filtered_rewards
+
+    def _compute_group_advantages(
+        self,
+        rewards: list[float],
+        prompts_in_batch: int,
+        normalize: bool,
+    ) -> list[float]:
+        advantages = [0.0] * len(rewards)
+        total = len(rewards)
+        if prompts_in_batch == 0 or total == 0:
+            return advantages
+        for prompt_idx in range(prompts_in_batch):
+            group_indices = [
+                prompt_idx + k * prompts_in_batch
+                for k in range(self.rollouts_per_example)
+                if (prompt_idx + k * prompts_in_batch) < total
+            ]
+            if not group_indices:
+                continue
+            group_rewards = [rewards[i] for i in group_indices]
+            mean = float(np.mean(group_rewards))
+            if normalize:
+                std = float(np.std(group_rewards)) + 1e-8
+                adv_values = [(r - mean) / std for r in group_rewards]
+            else:
+                adv_values = [r - mean for r in group_rewards]
+            for idx, adv in zip(group_indices, adv_values):
+                advantages[idx] = adv
+        return advantages
+
+    def _select_dapo_indices(
+        self,
+        rewards: list[float],
+        is_truncated: list[bool],
+        prompts: list[Any],
+        prompts_in_batch: int,
+        batch_id: int,
+    ) -> dict[str, Any]:
+        total_samples = len(rewards)
+        if total_samples == 0 or prompts_in_batch == 0:
+            return {"indices": [], "advantages": [], "metrics": {}}
+        kept_indices: set[int] = set()
+        adv_map: Dict[int, float] = {}
+        group_variances: list[float] = []
+        skipped_groups: list[dict[str, Any]] = []
+        selected_prompts: set[int] = set()
+        trunc_skips = 0
+        lowvar_skips = 0
+        sign_skips = 0
+        rng = np.random.default_rng(batch_id)
+        # build canonical prompt keys for the first sample in each group
+        def key_of(prompt_any: Any) -> str:
+            try:
+                if isinstance(prompt_any, list):
+                    return self.processing_class.apply_chat_template(
+                        prompt_any, tokenize=False, add_generation_prompt=True
+                    )
+                return str(prompt_any)
+            except Exception:
+                return str(prompt_any)
+
+        for prompt_idx in range(prompts_in_batch):
+            prompt_key = key_of(prompts[prompt_idx]) if prompt_idx < len(prompts) else str(prompt_idx)
+            group_indices = [
+                prompt_idx + k * prompts_in_batch
+                for k in range(self.rollouts_per_example)
+                if (prompt_idx + k * prompts_in_batch) < total_samples
+            ]
+            if not group_indices:
+                continue
+            valid = [idx for idx in group_indices if not is_truncated[idx]]
+            if not valid:
+                trunc_skips += 1
+                skipped_groups.append({"prompt": prompt_idx, "indices": valid})
+                continue
+            group_rewards = [rewards[idx] for idx in valid]
+            variance = float(np.var(group_rewards)) if len(group_rewards) > 1 else 0.0
+            keep = True
+            if self.dapo_params.dynamic_sampling:
+                historical_var = self.prompt_variance.get(prompt_key)
+                if historical_var is not None and historical_var < self.dapo_params.variance_threshold:
+                    keep = False
+                    lowvar_skips += 1
+                else:
+                    has_pos = any(r > 0 for r in group_rewards)
+                    has_non_pos = any(r <= 0 for r in group_rewards)
+                    if variance < self.dapo_params.variance_threshold:
+                        keep = False
+                        lowvar_skips += 1
+                    elif not (has_pos and has_non_pos):
+                        keep = False
+                        sign_skips += 1
+            if keep:
+                advantages = self._compute_dapo_advantages(
+                    group_rewards, self.dapo_params.normalize_advantages
+                )
+                for idx, adv in zip(valid, advantages):
+                    kept_indices.add(idx)
+                    adv_map[idx] = adv
+                group_variances.append(variance)
+                selected_prompts.add(prompt_idx)
+                # update historical variance
+                self.prompt_variance[prompt_key] = variance
+            else:
+                skipped_groups.append({"prompt": prompt_idx, "indices": valid, "key": prompt_key})
+                # record observed variance for future decisions
+                self.prompt_variance[prompt_key] = variance
+
+        total_prompts = max(prompts_in_batch, 1)
+        skip_ratio = len(skipped_groups) / total_prompts
+        reincluded = 0
+        if skip_ratio > self.dapo_params.skip_ratio_threshold and skipped_groups:
+            num_to_reinclude = max(
+                1, int(len(skipped_groups) * self.dapo_params.reinclude_fraction)
+            )
+            choices = (
+                rng.choice(len(skipped_groups), size=num_to_reinclude, replace=False)
+                if len(skipped_groups) > 1
+                else [0]
+            )
+            for choice in np.atleast_1d(choices):
+                group = skipped_groups[int(choice)]
+                valid = group["indices"]
+                if not valid:
+                    continue
+                group_rewards = [rewards[idx] for idx in valid]
+                advantages = self._compute_dapo_advantages(
+                    group_rewards, self.dapo_params.normalize_advantages
+                )
+                for idx, adv in zip(valid, advantages):
+                    kept_indices.add(idx)
+                    adv_map[idx] = adv
+                selected_prompts.add(group["prompt"])
+                reincluded += 1
+
+        ordered_indices = sorted(list(kept_indices))
+        ordered_advantages = [adv_map[idx] for idx in ordered_indices]
+        metrics = {
+            "dapo/prompts_total": float(total_prompts),
+            "dapo/prompts_selected": float(len(selected_prompts)),
+            "dapo/prompts_skipped": float(total_prompts - len(selected_prompts)),
+            "dapo/skip_ratio": float(skip_ratio),
+            "dapo/skip_truncated": float(trunc_skips),
+            "dapo/skip_lowvar": float(lowvar_skips),
+            "dapo/skip_one_sided": float(sign_skips),
+            "dapo/reincluded": float(reincluded),
+            "dapo/group_variance": float(np.mean(group_variances))
+            if group_variances
+            else 0.0,
+        }
+
+        return {
+            "indices": ordered_indices,
+            "advantages": ordered_advantages,
+            "metrics": metrics,
+        }
+
+    def _compute_dapo_advantages(
+        self,
+        group_rewards: List[float],
+        normalize: bool,
+    ) -> List[float]:
+        mean = float(np.mean(group_rewards))
+        if normalize:
+            std = float(np.std(group_rewards)) + 1e-8
+            return [(r - mean) / std for r in group_rewards]
+        return [r - mean for r in group_rewards]

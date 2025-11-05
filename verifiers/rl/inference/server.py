@@ -69,6 +69,8 @@ class WeightSyncWorkerExtension:
         self.pynccl_comm.group.barrier()
         self.model_runner.model.load_weights(weights=[(name, weight)])  # type: ignore
 
+    
+
     def close_communicator(self) -> None:
         if self.pynccl_comm is not None:
             del self.pynccl_comm

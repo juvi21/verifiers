@@ -100,6 +100,35 @@ We have removed a number of features from the previous `GRPOTrainer`, in favor o
 - Sampling configuration arguments:
   - `max_tokens`: the maximum number of tokens per request (default is `None`)
   - `temperature`: the temperature for the sampling (default is `0.7`)
+
+### Selecting the RL algorithm
+
+`RLTrainer` now supports both the legacy GRPO recipe and the DAPO recipe. Set `[trainer.args].rl_algo = "dapo"` to enable the DAPO path; the default remains `"grpo"`. When DAPO is selected, the trainer consumes an additional `[trainer.dapo]` table that mirrors the reference DAPO implementation:
+
+```toml
+[trainer.args]
+rl_algo = "dapo"
+
+[trainer.dapo]
+group_size = 4          # rollouts per prompt (overrides rollouts_per_example)
+eps_low = 0.2           # lower asymmetric clipping bound
+eps_high = 0.3          # upper asymmetric clipping bound
+max_length = 512        # generation cap for the policy model
+length_cache = 50       # soft-penalty window before max_length
+learning_rate = 1e-5    # overrides trainer learning rate
+max_grad_norm = 1.0     # overrides trainer grad clip
+dynamic_sampling = true # enable prompt-level variance filtering
+variance_threshold = 0.01
+skip_ratio_threshold = 0.5
+reinclude_fraction = 0.2
+normalize_advantages = true
+length_penalty_enabled = true
+length_penalty_target = 512
+length_penalty_max = 0.5
+truncation_penalty = 0.2
+```
+
+All of the knobs above are optional; `RLConfig` will fill in the defaults from the upstream DAPO reference. A full working example lives in `configs/rl/dapo-toy.toml`, which is sized for a single-GPU smoke test.
   - `top_p`: the top-p value for the sampling (default is `1.0`)
   - `top_k`: the top-k value for the sampling (default is `None`)
   - `min_p`: the minimum probability value for the sampling (default is `0.0`)

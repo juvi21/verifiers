@@ -31,7 +31,12 @@ def main():
     env_id = config["env"]["id"]
     env_args = config["env"].get("args", {})
     env = vf.load_environment(env_id=env_id, **env_args)
-    rl_config = vf.RLConfig(**config["trainer"].get("args", {}))
+    trainer_cfg = config.get("trainer", {})
+    trainer_args = dict(trainer_cfg.get("args", {}))
+    dapo_args = trainer_cfg.get("dapo")
+    if dapo_args:
+        trainer_args["dapo"] = dapo_args
+    rl_config = vf.RLConfig(**trainer_args)
     trainer = vf.RLTrainer(model=model, env=env, args=rl_config)
     trainer.train()
 

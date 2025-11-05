@@ -4,7 +4,10 @@ from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
-import deepspeed
+try:
+    import deepspeed  # type: ignore
+except Exception:  # pragma: no cover - optional at import time
+    deepspeed = None  # type: ignore
 import torch
 from accelerate.utils import (
     broadcast_object_list,
@@ -112,6 +115,8 @@ class RLTrainer(Trainer):
                 mask_truncated_completions=args.mask_truncated_completions,
                 zero_truncated_completions=args.zero_truncated_completions,
                 max_concurrent=args.max_concurrent,
+                rl_algo=args.rl_algo,
+                dapo_params=args.dapo,
             )
             self.generator.start()
             self.generator.submit_batch(0)
@@ -163,6 +168,11 @@ class RLTrainer(Trainer):
         ir_tracker = init_stat_tracker(self.accelerator.device)
         entropy_tracker = init_stat_tracker(self.accelerator.device)
         mismatch_kl_tracker = init_stat_tracker(self.accelerator.device)
+        clip_tracker = (
+            init_stat_tracker(self.accelerator.device)
+            if self.args.rl_algo == "dapo"
+            else None
+        )
         device = self.accelerator.device
         pad_token_id = getattr(self.processing_class, "pad_token_id", None)
         assert pad_token_id is not None
@@ -212,6 +222,8 @@ class RLTrainer(Trainer):
             update_stat_tracker(ir_tracker, summaries["importance_sampling"])
             update_stat_tracker(entropy_tracker, summaries["entropy"])
             update_stat_tracker(mismatch_kl_tracker, summaries["mismatch_kl"])
+            if clip_tracker is not None and "clip_fraction" in summaries:
+                update_stat_tracker(clip_tracker, summaries["clip_fraction"])
 
         ir_mean = finalize_stat_tracker(ir_tracker, self.accelerator)
         entropy_mean = finalize_stat_tracker(entropy_tracker, self.accelerator)
@@ -225,6 +237,9 @@ class RLTrainer(Trainer):
             "entropy": entropy_mean,
             "mismatch_kl": mismatch_kl_mean,
         }
+        if clip_tracker is not None:
+            clip_mean = finalize_stat_tracker(clip_tracker, self.accelerator) or 0.0
+            extra_metrics["clip_fraction"] = clip_mean
 
         if self.accelerator.is_main_process:
             metrics_to_log = {**batch.metrics_dict, **extra_metrics}
@@ -249,6 +264,9 @@ class RLTrainer(Trainer):
         num_items_in_batch: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, dict[str, torch.Tensor]]]:
         loss_mask = inputs["loss_mask"].bool()
+        if self.args.rl_algo == "dapo":
+            return self._compute_dapo_loss(inputs, loss_mask)
+
         entropies = inputs["entropies"]
         trainer_logprobs = inputs["trainer_logprobs"]
         inference_logprobs = inputs["inference_logprobs"]
@@ -272,6 +290,49 @@ class RLTrainer(Trainer):
             "importance_sampling": ir_summary,
             "entropy": entropy_summary,
             "mismatch_kl": mismatch_kl_summary,
+        }
+        return loss, summaries
+
+    def _compute_dapo_loss(
+        self,
+        inputs: dict[str, torch.Tensor],
+        loss_mask: torch.Tensor,
+    ):
+        entropies = inputs["entropies"]
+        trainer_logprobs = inputs["trainer_logprobs"]
+        inference_logprobs = inputs["inference_logprobs"]
+        advantages = inputs["advantages"]
+        log_importance_ratio = trainer_logprobs - inference_logprobs
+        importance_ratio = torch.exp(log_importance_ratio)
+        eps_low = torch.tensor(
+            self.args.dapo.eps_low, device=importance_ratio.device, dtype=importance_ratio.dtype
+        )
+        eps_high = torch.tensor(
+            self.args.dapo.eps_high, device=importance_ratio.device, dtype=importance_ratio.dtype
+        )
+        clipped_ratio = torch.clamp(
+            importance_ratio,
+            1.0 - eps_low,
+            1.0 + eps_high,
+        )
+        unclipped_loss = importance_ratio * advantages
+        clipped_loss = clipped_ratio * advantages
+        per_token_loss = torch.minimum(unclipped_loss, clipped_loss)
+        loss = -per_token_loss[loss_mask].sum()
+        mismatch_kl = torch.exp(log_importance_ratio) - log_importance_ratio - 1
+        clip_events = torch.ne(importance_ratio, clipped_ratio).float()
+
+        with torch.no_grad():
+            ir_summary = summarize_values(importance_ratio[loss_mask])
+            entropy_summary = summarize_values(entropies[loss_mask])
+            mismatch_kl_summary = summarize_values(mismatch_kl[loss_mask])
+            clip_summary = summarize_values(clip_events[loss_mask])
+
+        summaries = {
+            "importance_sampling": ir_summary,
+            "entropy": entropy_summary,
+            "mismatch_kl": mismatch_kl_summary,
+            "clip_fraction": clip_summary,
         }
         return loss, summaries
 
@@ -333,8 +394,8 @@ class RLTrainer(Trainer):
             zero_stage_3 = (
                 deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
             )
-            if zero_stage_3:
-                gather_if_zero3 = deepspeed.zero.GatheredParameters
+            if zero_stage_3 and deepspeed is not None:
+                gather_if_zero3 = deepspeed.zero.GatheredParameters  # type: ignore[attr-defined]
             else:
                 gather_if_zero3 = nullcontext
             self.accelerator.wait_for_everyone()

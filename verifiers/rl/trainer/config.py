@@ -7,6 +7,74 @@ from transformers.trainer_utils import SchedulerType
 
 
 @dataclass
+class DAPOHyperParams:
+    group_size: int = field(
+        default=4,
+        metadata={"help": "Number of responses sampled per prompt."},
+    )
+    eps_low: float = field(
+        default=0.2,
+        metadata={"help": "Lower asymmetric clipping threshold."},
+    )
+    eps_high: float = field(
+        default=0.3,
+        metadata={"help": "Upper asymmetric clipping threshold."},
+    )
+    max_length: int = field(
+        default=512,
+        metadata={"help": "Maximum generation length for DAPO training."},
+    )
+    length_cache: int = field(
+        default=50,
+        metadata={"help": "Window before max_length where soft length penalty starts."},
+    )
+    learning_rate: float = field(
+        default=1e-5,
+        metadata={"help": "Optimizer learning rate for DAPO runs."},
+    )
+    max_grad_norm: float = field(
+        default=1.0,
+        metadata={"help": "Gradient clipping norm for DAPO runs."},
+    )
+    dynamic_sampling: bool = field(
+        default=True,
+        metadata={"help": "Enable dynamic prompt sampling based on reward variance."},
+    )
+    variance_threshold: float = field(
+        default=0.01,
+        metadata={"help": "Minimum per-prompt reward variance before skipping."},
+    )
+    skip_ratio_threshold: float = field(
+        default=0.5,
+        metadata={"help": "If skipped prompts exceed this ratio, re-include some."},
+    )
+    reinclude_fraction: float = field(
+        default=0.2,
+        metadata={"help": "Fraction of skipped prompts to re-include when needed."},
+    )
+    normalize_advantages: bool = field(
+        default=True,
+        metadata={"help": "Z-score advantages within each prompt group."},
+    )
+    length_penalty_enabled: bool = field(
+        default=True,
+        metadata={"help": "Apply soft length penalty to overlong responses."},
+    )
+    length_penalty_target: int = field(
+        default=512,
+        metadata={"help": "Target length for soft penalty calculations."},
+    )
+    length_penalty_max: float = field(
+        default=0.5,
+        metadata={"help": "Maximum fractional penalty for long responses."},
+    )
+    truncation_penalty: float = field(
+        default=0.2,
+        metadata={"help": "Penalty multiplier for truncated completions."},
+    )
+
+
+@dataclass
 class RLConfig(TrainingArguments):
     """
     Configuration class for RLTrainer.
@@ -272,6 +340,14 @@ class RLConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to shuffle the training dataset."},
     )
+    rl_algo: str = field(
+        default="grpo",
+        metadata={"help": "Reinforcement learning algorithm to use (grpo or dapo)."},
+    )
+    dapo: DAPOHyperParams = field(
+        default_factory=DAPOHyperParams,
+        metadata={"help": "Hyperparameters specific to the DAPO algorithm."},
+    )
 
     def __post_init__(self):
         # configure output dir
@@ -303,6 +379,19 @@ class RLConfig(TrainingArguments):
         self.per_device_train_batch_size = self.micro_batch_size
         if self.eval_strategy != "no":
             self.per_device_eval_batch_size = self.micro_batch_size
+
+        # normalize rl algo + dapo params
+        if isinstance(self.dapo, dict):
+            self.dapo = DAPOHyperParams(**self.dapo)
+        self.rl_algo = self.rl_algo.lower()
+        if self.rl_algo not in {"grpo", "dapo"}:
+            raise ValueError("rl_algo must be either 'grpo' or 'dapo'.")
+        if self.rl_algo == "dapo":
+            self.rollouts_per_example = self.dapo.group_size
+            self.learning_rate = self.dapo.learning_rate
+            self.max_grad_norm = self.dapo.max_grad_norm
+            if self.max_tokens is None or self.max_tokens > self.dapo.max_length:
+                self.max_tokens = self.dapo.max_length
 
         self.sampling_args = {
             "temperature": self.temperature,
