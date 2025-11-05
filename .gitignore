@@ -27,6 +27,7 @@ docs/build/
 *.pyo
 *.pyd
 *.pyc
+*.deb
 
 # outputs
 wandb/
